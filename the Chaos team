@@ -1,0 +1,278 @@
+
+## backend/app.py
+
+```python
+# backend/app.py
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import tempfile
+import os
+from typing import Optional
+from pathlib import Path
+from tts_providers import generate_audio_for_text
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+OUTPUT_DIR = Path("/tmp/audiobooks")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+@app.post("/api/generate-audio")
+async def generate_audio(
+    text: Optional[str] = Form(None),
+    tone: Optional[str] = Form("neutral"),
+    voice: Optional[str] = Form("default"),
+    format: Optional[str] = Form("mp3"),
+    file: Optional[UploadFile] = File(None),
+):
+    """Accepts raw text or an uploaded file (txt/md/pdf). Returns JSON with download URL."""
+    # Extract text
+    if file is not None:
+        contents = await file.read()
+        # naive extraction for txt
+        if file.filename.lower().endswith((".txt", ".md")):
+            text = contents.decode(errors="ignore")
+        elif file.filename.lower().endswith(".pdf"):
+            # optional: integrate PyPDF2 or pdfminer
+            try:
+                from PyPDF2 import PdfReader
+                import io
+                reader = PdfReader(io.BytesIO(contents))
+                text = "\n".join(p.extract_text() or "" for p in reader.pages)
+            except Exception:
+                return JSONResponse({"error": "PDF processing requires PyPDF2. Install extras."}, status_code=422)
+    if not text:
+        return JSONResponse({"error": "No text provided."}, status_code=400)
+
+    # sanitize and prepare (simple chunking example)
+    max_chars = 3000
+    chunks = [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
+
+    # call provider
+    out_file = OUTPUT_DIR / f"audiobook_{os.getpid()}_{len(list(OUTPUT_DIR.glob('*.mp3')))}.mp3"
+    try:
+        generate_audio_for_text(chunks=chunks, out_path=str(out_file), voice=voice, tone=tone, fmt=format)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    return {"download_url": f"/api/download/{out_file.name}"}
+
+
+@app.get("/api/download/{filename}")
+async def download(filename: str):
+    path = OUTPUT_DIR / filename
+    if not path.exists():
+        return JSONResponse({"error": "file not found"}, status_code=404)
+    return FileResponse(path, media_type="audio/mpeg", filename=filename)
+
+```
+
+---
+
+## backend/tts\_providers.py
+
+```python
+# backend/tts_providers.py
+import os
+from typing import List
+
+# This module provides a single function `generate_audio_for_text` that accepts
+# text chunks and writes a single output file. Replace provider logic inside
+# `provider_generate` to use OpenAI/ElevenLabs/your local TTS.
+
+def generate_audio_for_text(chunks: List[str], out_path: str, voice: str = "default", tone: str = "neutral", fmt: str = "mp3"):
+    """High-level orchestration: produce audio for each chunk and concatenate into out_path.
+    - chunks: list of text blobs
+    - voice: provider voice id
+    - tone: e.g. 'inspiring', 'suspenseful', 'neutral' (you can convert into SSML tags)
+    - fmt: 'mp3' or 'wav'
+    """
+    tmp_files = []
+    for i, chunk in enumerate(chunks):
+        filename = f"/tmp/part_{i}.mp3"
+        provider_generate(text=chunk, out_file=filename, voice=voice, tone=tone)
+        tmp_files.append(filename)
+
+    # naive concatenation using pydub (recommended) or ffmpeg
+    try:
+        from pydub import AudioSegment
+        combined = None
+        for f in tmp_files:
+            seg = AudioSegment.from_file(f)
+            if combined is None:
+                combined = seg
+            else:
+                combined += seg
+        # export
+        combined.export(out_path, format=fmt)
+    except Exception as e:
+        # fallback: try ffmpeg concat
+        # create a file list
+        listfile = "/tmp/concat_list.txt"
+        with open(listfile, "w") as fh:
+            for f in tmp_files:
+                fh.write(f"file '{f}'\n")
+        os.system(f"ffmpeg -f concat -safe 0 -i {listfile} -c copy {out_path}")
+
+    # cleanup
+    for f in tmp_files:
+        try:
+            os.remove(f)
+        except:
+            pass
+
+
+def provider_generate(text: str, out_file: str, voice: str = "default", tone: str = "neutral"):
+    """Replace this function with a provider implementation.
+
+    Two example approaches (pseudocode):
+
+    1) **OpenAI (if they offer TTS in your environment)**
+       - Call their TTS/audio.speech endpoint with text or SSML, pass voice param.
+       - Save returned audio bytes to `out_file`.
+
+    2) **ElevenLabs** (HTTP API) — you would send POST to their TTS endpoint with api key.
+
+    3) **Local fallback (pyttsx3)** — good for hack demos without external API keys.
+    """
+    provider = os.getenv("TTS_PROVIDER", "local")
+
+    if provider == "openai":
+        # Pseudocode (fill with real SDK call)
+        # import openai
+        # openai.api_key = os.getenv('OPENAI_API_KEY')
+        # resp = openai.audio.speech.create(...)
+        # with open(out_file, 'wb') as f: f.write(resp)
+        raise NotImplementedError("OpenAI provider not implemented in template — add SDK call")
+
+    elif provider == "elevenlabs":
+        # Pseudocode using requests
+        # import requests
+        # headers = { 'xi-api-key': os.getenv('ELEVENLABS_API_KEY') }
+        # data = {...}
+        # r = requests.post('https://api.elevenlabs.io/v1/text-to-speech/{voice}/stream', headers=headers, json=data)
+        # with open(out_file,'wb') as f: f.write(r.content)
+        raise NotImplementedError("ElevenLabs provider not implemented in template — add request call")
+
+    else:
+        # local pyttsx3 fallback
+        try:
+            import pyttsx3
+            engine = pyttsx3.init()
+            # basic settings
+            engine.setProperty('rate', 150)
+            engine.setProperty('volume', 1.0)
+            # voice selection naive
+            voices = engine.getProperty('voices')
+            if voice != 'default' and len(voices) > 0:
+                # choose first
+                engine.setProperty('voice', voices[0].id)
+            engine.save_to_file(text, out_file)
+            engine.runAndWait()
+        except Exception as e:
+            raise RuntimeError(f"Local TTS failed: {e}")
+```
+
+---
+
+## frontend/App.js
+
+```jsx
+// frontend/App.js (drop into CRA src/App.js)
+import React, { useState } from 'react';
+
+function App(){
+  const [text, setText] = useState('');
+  const [tone, setTone] = useState('neutral');
+  const [voice, setVoice] = useState('default');
+  const [loading, setLoading] = useState(false);
+  const [downloadUrl, setDownloadUrl] = useState(null);
+
+  async function handleGenerate(e){
+    e.preventDefault();
+    setLoading(true);
+    const form = new FormData();
+    form.append('text', text);
+    form.append('tone', tone);
+    form.append('voice', voice);
+    form.append('format', 'mp3');
+
+    const resp = await fetch('/api/generate-audio', { method: 'POST', body: form });
+    const j = await resp.json();
+    setLoading(false);
+    if(j.download_url){
+      setDownloadUrl(j.download_url);
+    } else if (j.error){
+      alert('Error: ' + j.error);
+    }
+  }
+
+  return (
+    <div style={{maxWidth:800, margin:'2rem auto', fontFamily:'sans-serif'}}>
+      <h1>AI Audiobook — Hackathon demo</h1>
+      <form onSubmit={handleGenerate}>
+        <label>Paste text or upload file:</label>
+        <textarea value={text} onChange={e=>setText(e.target.value)} rows={10} style={{width:'100%'}} />
+
+        <div style={{display:'flex', gap:12, marginTop:8}}>
+          <label>
+            Tone
+            <select value={tone} onChange={e=>setTone(e.target.value)}>
+              <option value="neutral">Neutral</option>
+              <option value="inspiring">Inspiring</option>
+              <option value="suspenseful">Suspenseful</option>
+            </select>
+          </label>
+
+          <label>
+            Voice
+            <select value={voice} onChange={e=>setVoice(e.target.value)}>
+              <option value="default">Default</option>
+              <option value="male_1">Male 1</option>
+              <option value="female_1">Female 1</option>
+            </select>
+          </label>
+        </div>
+
+        <div style={{marginTop:12}}>
+          <button disabled={loading} type="submit">{loading ? 'Generating...' : 'Generate Audiobook'}</button>
+        </div>
+      </form>
+
+      {downloadUrl && (
+        <div style={{marginTop:20}}>
+          <h3>Download / Play</h3>
+          <audio controls src={downloadUrl}></audio>
+          <div><a href={downloadUrl} download>Download MP3</a></div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default App;
+```
+
+---
+
+
+
+## Dockerfile (backend)
+
+```dockerfile
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y ffmpeg build-essential libasound2 libsndfile1
+WORKDIR /app
+COPY backend/ ./
+RUN pip install --no-cache-dir -r requirements.txt
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+---
+
